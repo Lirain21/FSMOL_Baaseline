@@ -12,18 +12,16 @@ from pyprojroot import here as project_root
 
 sys.path.insert(0, str(project_root()))
 
-
 from fs_mol.models.abstract_torch_fsmol_model import linear_warmup
 from fs_mol.data import FSMolDataset, FSMolTaskSample, DataFold
-from fs_mol.data.dkt import (
+from fs_mol.data.prw_dkt import (
     DKTBatch,
     get_dkt_task_sample_iterable,
     get_dkt_batcher,
     task_sample_to_dkt_task_sample,
 )
 
-
-from fs_mol.models.par import PARModel, PARModelConfig
+from fs_mol.models.prw import PRWModel, PRWModelConfig
 from fs_mol.models.abstract_torch_fsmol_model import MetricType
 from fs_mol.utils.metrics import (
     compute_binary_task_metrics,
@@ -44,20 +42,20 @@ from fs_mol.utils._stateless import functional_call
 # Chem lib stuff
 from chem_lib.models.maml import MAML
 
-
 logger = logging.getLogger(__name__)
 
-
 @dataclass(frozen=True)
-class PARModelTrainerConfig(PARModelConfig):
+class PRWModelTrainerConfig(PRWModelConfig):
     batch_size: int = 256
     tasks_per_batch: int = 9  # from their code
     support_set_size: int = 16
     query_set_size: int = 256
+    unlabeled_set_size: int = 10 
 
     num_train_steps: int = 10000
     validate_every_num_steps: int = 50
     validation_support_set_sizes: Tuple[int] = (16, 128)
+    validation_unlabeled_set_sizes: int = 10
     validation_query_set_size: int = 256
     validation_num_samples: int = 5
 
@@ -91,15 +89,14 @@ class PARModelTrainerConfig(PARModelConfig):
 
     # MAML
     second_order_maml: bool = True
-
     use_numeric_labels: bool = False
 
 def get_predictions(model, data_batch: DKTBatch, train=True, **kwargs):
-    """Make PAR predictions"""
+    """Make PRW predictions"""
 
     # if train:
-    s_logits, q_logits, adj, s_node_emb = model(input_batch=data_batch, **kwargs)
-    pred_dict = {'s_logits': s_logits, 'q_logits': q_logits, 'adj': adj,}
+    s_logits, q_logits= model(input_batch=data_batch, **kwargs)
+    pred_dict = {'s_logits': s_logits, 'q_logits': q_logits}
 
     return pred_dict
 
@@ -123,8 +120,8 @@ def get_loss(model: MAML, pred_dict: dict, train: bool, flag: bool, batch_featur
         )
     else:
         losses_adapt = criterion(
-            input=pred_dict['s_logits'].reshape(-1,2), 
-            target=support_labels.repeat(n_query)
+            input=pred_dict['s_logits'], 
+            target=support_labels
         )
 
     # This whole block we did not modify, except for changing "batch_data" variables
@@ -132,33 +129,7 @@ def get_loss(model: MAML, pred_dict: dict, train: bool, flag: bool, batch_featur
         print('!!!!!!!!!!!!!!!!!!! Nan value for supervised CE loss', losses_adapt)
         print(pred_dict['s_logits'])
         losses_adapt = torch.zeros_like(losses_adapt)
-    if model.config.reg_adj > 0:
-        n_support = len(batch_features.support_labels)
-        adj = pred_dict['adj'][-1]
-        if train:
-            if flag:
-                s_label = support_labels.unsqueeze(0).repeat(n_query, 1)
-                n_d = n_query * n_support
-                label_edge = model.label2edge(s_label).reshape((n_d, -1))
-                pred_edge = adj[:,:,:-1,:-1].reshape((n_d, -1))
-            else:
-                s_label = support_labels.unsqueeze(0).repeat(n_query, 1)
-                q_label = query_labels.unsqueeze(1)
-                total_label = torch.cat((s_label, q_label), 1)
-                label_edge = model.label2edge(total_label)[:,:,-1,:-1]
-                pred_edge = adj[:,:,-1,:-1]
-        else:
-            s_label = support_labels.unsqueeze(0)
-            n_d = n_support
-            label_edge = model.label2edge(s_label).reshape((n_d, -1))
-            pred_edge = adj[:, :, :n_support, :n_support].mean(0).reshape((n_d, -1))
-        adj_loss_val = F.mse_loss(pred_edge, label_edge)
-        if torch.isnan(adj_loss_val).any() or torch.isinf(adj_loss_val).any():
-            print('!!!!!!!!!!!!!!!!!!!  Nan value for adjacency loss', adj_loss_val)
-            adj_loss_val = torch.zeros_like(adj_loss_val)
-
-        losses_adapt += model.config.reg_adj * adj_loss_val
-
+  
     return losses_adapt
     
 def get_adaptable_weights(model):
@@ -166,9 +137,7 @@ def get_adaptable_weights(model):
 
     # Note: no warmup
     fenc = lambda x: x[0]== 'graph_feature_extractor' or x[0] == "enc_fc"
-    fedge = lambda x: x[0]== 'adapt_relation' and 'edge_layer'  in x[1]
-    fnode = lambda x: x[0]== 'adapt_relation' and 'node_layer'  in x[1]
-    flag=lambda x: not (fenc(x) or fnode(x) or fedge(x))
+    flag=lambda x: not (fenc(x))
     adaptable_weights = []
     adaptable_names=[]
     for name, p in model.module.named_parameters():
@@ -224,7 +193,6 @@ def run_on_batches(
                     task_labels.append(this_batch_labels.detach().cpu().numpy())
                 task_preds.append(batch_preds.detach().cpu().numpy())
         
-
     if train:
         metrics = None
     else:
@@ -238,10 +206,11 @@ def run_on_batches(
     return cloned_models, metrics
 
 
-def evaluate_par_model(
-    model: PARModel,
+def evaluate_prw_model(
+    model: PRWModel,
     dataset: FSMolDataset,
     support_sizes: List[int] = [16, 128],
+    unlabeled_size: int = 10, 
     num_samples: int = 5,
     seed: int = 0,
     batch_size: int = 320,
@@ -290,6 +259,7 @@ def evaluate_par_model(
         train_set_sample_sizes=support_sizes,
         out_dir=save_dir,
         num_samples=num_samples,
+        valid_size_or_ratio=unlabeled_size,
         test_size_or_ratio=query_size,
         fold=data_fold,
         seed=seed,
@@ -298,7 +268,7 @@ def evaluate_par_model(
 
 
 def validate_by_finetuning_on_tasks(
-    model: PARModel,
+    model: PRWModel,
     dataset: FSMolDataset,
     seed: int = 0,
     aml_run=None,
@@ -310,10 +280,11 @@ def validate_by_finetuning_on_tasks(
     final results are a mean value for all tasks over the requested metric.
     """
 
-    task_results = evaluate_par_model(
+    task_results = evaluate_prw_model(
         model,
         dataset,
         support_sizes=model.config.validation_support_set_sizes,
+        unlabeled_size=model.config.validation_unlabeled_set_sizes, 
         num_samples=model.config.validation_num_samples,
         seed=seed,
         batch_size=model.config.batch_size,
@@ -333,8 +304,8 @@ def validate_by_finetuning_on_tasks(
     return mean_metrics[metric_to_use][0]
 
 
-class PARModelTrainer(PARModel):
-    def __init__(self, config: PARModelTrainerConfig):
+class PRWModelTrainer(PRWModel):
+    def __init__(self, config: PRWModelTrainerConfig):
         super().__init__(config)
         self.config = config
         self.lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None
@@ -430,7 +401,7 @@ class PARModelTrainer(PARModel):
         config_overrides: Dict[str, Any] = {},
         quiet: bool = False,
         device: Optional[torch.device] = None,
-    ) -> "PARModelTrainer":
+    ) -> "PRWModelTrainer":
         """Build the model architecture based on a saved checkpoint."""
         checkpoint = torch.load(model_file, map_location=device)
         config = checkpoint["model_config"]
@@ -438,7 +409,7 @@ class PARModelTrainer(PARModel):
         if not quiet:
             logger.info(f" Loading model configuration from {model_file}.")
 
-        model = PARModelTrainer(config)
+        model = PRWModelTrainer(config)
         model.load_model_weights(
             path=model_file,
             quiet=quiet,
@@ -458,6 +429,7 @@ class PARModelTrainer(PARModel):
                 max_num_graphs=self.config.batch_size,
                 support_size=self.config.support_set_size,
                 query_size=self.config.query_set_size,
+                unlabeled_size=self.config.unlabeled_set_size,
                 repeat=True,
                 filter_numeric_labels=self.config.use_numeric_labels,
             )

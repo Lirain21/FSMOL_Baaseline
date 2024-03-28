@@ -18,9 +18,9 @@ from fs_mol.modules.graph_feature_extractor import (
     make_graph_feature_extractor_config_from_args,
 )
 from fs_mol.utils.cli_utils import add_train_cli_args, set_up_train_run
-from fs_mol.utils.par_utils import (
-    PARModelTrainerConfig,
-    PARModelTrainer,
+from fs_mol.utils.tpn_utils import (
+    TPNModelTrainerConfig,
+    TPNModelTrainer,
 )
 
 
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 def parse_command_line():
     parser = argparse.ArgumentParser(
-        description="Train a PAR model on molecules.",
+        description="Train a TPN model on molecules.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -52,7 +52,7 @@ def parse_command_line():
     )
     add_graph_feature_extractor_arguments(parser)
 
-    parser.add_argument("--support_set_size", type=int, default=16, help="Size of support set")
+    parser.add_argument("--support_set_size", type=int, default=64, help="Size of support set")
     parser.add_argument(
         "--query_set_size",
         type=int,
@@ -118,10 +118,10 @@ def parse_command_line():
     return args
 
 
-def make_trainer_config(args: argparse.Namespace) -> PARModelTrainerConfig:
+def make_trainer_config(args: argparse.Namespace) -> TPNModelTrainerConfig:
     if args.use_numeric_labels:
         raise NotImplementedError
-    return PARModelTrainerConfig(
+    return TPNModelTrainerConfig(
         graph_feature_extractor_config=make_graph_feature_extractor_config_from_args(args),
         used_features=args.features,
         batch_size=args.batch_size,
@@ -145,11 +145,11 @@ def main():
     config = make_trainer_config(args)
 
     out_dir, dataset, aml_run = set_up_train_run(
-        f"PARModel_{config.used_features}", args, torch=True
+        f"TPNModel_{config.used_features}", args, torch=True
     )
 
-    device = torch.device("cuda:4" if torch.cuda.is_available() else "cpu")
-    model_trainer = PARModelTrainer(config=config).to(device)
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    model_trainer = TPNModelTrainer(config=config).to(device)
 
     logger.info(f"\tDevice: {device}")
     logger.info(f"\tNum parameters {sum(p.numel() for p in model_trainer.parameters())}")

@@ -18,9 +18,9 @@ from fs_mol.modules.graph_feature_extractor import (
     make_graph_feature_extractor_config_from_args,
 )
 from fs_mol.utils.cli_utils import add_train_cli_args, set_up_train_run
-from fs_mol.utils.par_utils import (
-    PARModelTrainerConfig,
-    PARModelTrainer,
+from fs_mol.utils.prw_utils import (
+    PRWModelTrainerConfig,
+    PRWModelTrainer,
 )
 
 
@@ -52,12 +52,18 @@ def parse_command_line():
     )
     add_graph_feature_extractor_arguments(parser)
 
-    parser.add_argument("--support_set_size", type=int, default=16, help="Size of support set")
+    parser.add_argument("--support_set_size", type=int, default=16, help="Size of support set")   
     parser.add_argument(
         "--query_set_size",
         type=int,
         default=256,
         help="Size of target set. If -1, use everything but train examples.",
+    )
+    parser.add_argument(
+        "--unlabeled_set_size",
+        type=int,
+        default=10,
+        help="Size of unlabeled set."
     )
     parser.add_argument(
         "--tasks_per_batch",
@@ -118,16 +124,17 @@ def parse_command_line():
     return args
 
 
-def make_trainer_config(args: argparse.Namespace) -> PARModelTrainerConfig:
+def make_trainer_config(args: argparse.Namespace) -> PRWModelTrainerConfig:
     if args.use_numeric_labels:
         raise NotImplementedError
-    return PARModelTrainerConfig(
+    return PRWModelTrainerConfig(
         graph_feature_extractor_config=make_graph_feature_extractor_config_from_args(args),
         used_features=args.features,
         batch_size=args.batch_size,
         tasks_per_batch=args.tasks_per_batch,
         support_set_size=args.support_set_size,
         query_set_size=args.query_set_size,
+        unlabeled_set_size = args.unlabeled_set_size,
         validate_every_num_steps=args.validate_every,
         validation_support_set_sizes=tuple(args.validation_support_set_sizes),
         validation_query_set_size=args.validation_query_set_size,
@@ -145,11 +152,11 @@ def main():
     config = make_trainer_config(args)
 
     out_dir, dataset, aml_run = set_up_train_run(
-        f"PARModel_{config.used_features}", args, torch=True
+        f"PRWModel_{config.used_features}", args, torch=True
     )
 
     device = torch.device("cuda:4" if torch.cuda.is_available() else "cpu")
-    model_trainer = PARModelTrainer(config=config).to(device)
+    model_trainer = PRWModelTrainer(config=config).to(device)
 
     logger.info(f"\tDevice: {device}")
     logger.info(f"\tNum parameters {sum(p.numel() for p in model_trainer.parameters())}")

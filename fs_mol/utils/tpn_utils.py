@@ -21,9 +21,7 @@ from fs_mol.data.dkt import (
     get_dkt_batcher,
     task_sample_to_dkt_task_sample,
 )
-
-
-from fs_mol.models.par import PARModel, PARModelConfig
+from fs_mol.models.tpn import TPNModel, TPNModelConfig
 from fs_mol.models.abstract_torch_fsmol_model import MetricType
 from fs_mol.utils.metrics import (
     compute_binary_task_metrics,
@@ -49,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class PARModelTrainerConfig(PARModelConfig):
+class TPNModelTrainerConfig(TPNModelConfig):
     batch_size: int = 256
     tasks_per_batch: int = 9  # from their code
     support_set_size: int = 16
@@ -89,9 +87,6 @@ class PARModelTrainerConfig(PARModelConfig):
     rel_layer: int = 2
     rel_edge_layer: int = 2
 
-    # MAML
-    second_order_maml: bool = True
-
     use_numeric_labels: bool = False
 
 def get_predictions(model, data_batch: DKTBatch, train=True, **kwargs):
@@ -103,17 +98,16 @@ def get_predictions(model, data_batch: DKTBatch, train=True, **kwargs):
 
     return pred_dict
 
-def get_loss(model: MAML, pred_dict: dict, train: bool, flag: bool, batch_features: DKTBatch):
+def get_loss(model, pred_dict: dict, train: bool, flag: bool, batch_features: DKTBatch):
     """Loss for the PAR model"""
     criterion = torch.nn.CrossEntropyLoss().to(pred_dict["s_logits"])
-
     # Cast appropriate things to int
     support_labels = batch_features.support_labels.to(torch.long)
     query_labels = batch_features.query_labels.to(torch.long)
-
-    # Define their n_query/etc variables
     n_query = len(batch_features.query_labels)
-
+   
+    # Define their n_query/etc variables
+   
     # Simplified version of their logic
     if train and not flag:
         # losses_adapt = self.criterion(pred_dict['q_logits'], batch_data['q_label'])
@@ -126,12 +120,12 @@ def get_loss(model: MAML, pred_dict: dict, train: bool, flag: bool, batch_featur
             input=pred_dict['s_logits'].reshape(-1,2), 
             target=support_labels.repeat(n_query)
         )
-
+    
     # This whole block we did not modify, except for changing "batch_data" variables
     if torch.isnan(losses_adapt).any() or torch.isinf(losses_adapt).any():
-        print('!!!!!!!!!!!!!!!!!!! Nan value for supervised CE loss', losses_adapt)
-        print(pred_dict['s_logits'])
-        losses_adapt = torch.zeros_like(losses_adapt)
+        # print('!!!!!!!!!!!!!!!!!!! Nan value for supervised CE loss', losses_adapt)
+        # print(pred_dict['s_logits'])
+        losses_adapt = torch.zeros_like(losses_adapt, requires_grad=True)
     if model.config.reg_adj > 0:
         n_support = len(batch_features.support_labels)
         adj = pred_dict['adj'][-1]
@@ -157,29 +151,12 @@ def get_loss(model: MAML, pred_dict: dict, train: bool, flag: bool, batch_featur
             print('!!!!!!!!!!!!!!!!!!!  Nan value for adjacency loss', adj_loss_val)
             adj_loss_val = torch.zeros_like(adj_loss_val)
 
-        losses_adapt += model.config.reg_adj * adj_loss_val
+        losses_adapt = losses_adapt + model.config.reg_adj * adj_loss_val
 
     return losses_adapt
-    
-def get_adaptable_weights(model):
-    """Hard coded version of the '5' setting in their code."""
-
-    # Note: no warmup
-    fenc = lambda x: x[0]== 'graph_feature_extractor' or x[0] == "enc_fc"
-    fedge = lambda x: x[0]== 'adapt_relation' and 'edge_layer'  in x[1]
-    fnode = lambda x: x[0]== 'adapt_relation' and 'node_layer'  in x[1]
-    flag=lambda x: not (fenc(x) or fnode(x) or fedge(x))
-    adaptable_weights = []
-    adaptable_names=[]
-    for name, p in model.module.named_parameters():
-        names=name.split('.')
-        if flag(names):
-            adaptable_weights.append(p)
-            adaptable_names.append(name)
-    return adaptable_weights
 
 def run_on_batches(
-    maml_model: MAML,
+    model:TPNModel,
     batches: List[DKTBatch],
     batch_labels: List[torch.Tensor],
     batch_numeric_labels: List[torch.Tensor],
@@ -198,33 +175,27 @@ def run_on_batches(
     #num_gradient_accumulation_steps = len(batches) * tasks_per_batch
     cloned_models = []
     for batch_features, this_batch_labels, this_batch_numeric_labels in zip(batches, batch_labels, batch_numeric_labels):
-        
-        model = maml_model.clone()
         model.train()
-        adaptable_weights = get_adaptable_weights(model)
-        if train:
-            cloned_models.append(model)
-                        
-        # MAML adaptation
-        for inner_step in range(model.config.num_inner_update_step):
-            pred_adapt = get_predictions(model=model, data_batch=batch_features, train=True)
-            loss_adapt = get_loss(model=model, pred_dict=pred_adapt, train=True, flag = True, batch_features=batch_features)
-            model.adapt(loss_adapt, adaptable_weights = adaptable_weights)
+        pred_adapt = get_predictions(model=model, data_batch=batch_features, train=True)
+        loss_adapt = get_loss(model=model, pred_dict=pred_adapt, train=True, flag = True, batch_features=batch_features)
+        ## TODO: grad back propgation 
+        # if train:
+            # loss_adapt.backward()
+
+        total_loss += loss_adapt
         
         # Compute loss on the support set at test time
         if not train:
             model.eval()
             with torch.no_grad():
                 pred_eval = get_predictions(model=model, data_batch=batch_features, train=False)
-
                 if model.config.use_numeric_labels:
                     raise NotImplementedError
                 else:
                     batch_preds = F.softmax(pred_eval['q_logits'],dim=-1).detach()[:,1]
                     task_labels.append(this_batch_labels.detach().cpu().numpy())
                 task_preds.append(batch_preds.detach().cpu().numpy())
-        
-
+    
     if train:
         metrics = None
     else:
@@ -235,11 +206,11 @@ def run_on_batches(
         else:
             metrics = compute_binary_task_metrics(predictions=predictions, labels=labels)
 
-    return cloned_models, metrics
+    return total_loss, metrics
 
 
 def evaluate_par_model(
-    model: PARModel,
+    model: TPNModel,
     dataset: FSMolDataset,
     support_sizes: List[int] = [16, 128],
     num_samples: int = 5,
@@ -298,17 +269,12 @@ def evaluate_par_model(
 
 
 def validate_by_finetuning_on_tasks(
-    model: PARModel,
+    model: TPNModel,
     dataset: FSMolDataset,
     seed: int = 0,
     aml_run=None,
     metric_to_use: MetricType = "avg_precision",
 ) -> float:
-    """
-    Validation function for PARModel. Similar to test function;
-    each validation task is used to evaluate the model more than once, the
-    final results are a mean value for all tasks over the requested metric.
-    """
 
     task_results = evaluate_par_model(
         model,
@@ -333,10 +299,12 @@ def validate_by_finetuning_on_tasks(
     return mean_metrics[metric_to_use][0]
 
 
-class PARModelTrainer(PARModel):
-    def __init__(self, config: PARModelTrainerConfig):
+class TPNModelTrainer(TPNModel):
+    def __init__(self, config: TPNModelTrainerConfig):
         super().__init__(config)
         self.config = config
+        self.optimizer = torch.optim.Adam(self.parameters(), config.inner_learning_rate/100)
+
         self.lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None
 
     def get_model_state(self) -> Dict[str, Any]:
@@ -430,7 +398,7 @@ class PARModelTrainer(PARModel):
         config_overrides: Dict[str, Any] = {},
         quiet: bool = False,
         device: Optional[torch.device] = None,
-    ) -> "PARModelTrainer":
+    ) -> "TPNModelTrainer":
         """Build the model architecture based on a saved checkpoint."""
         checkpoint = torch.load(model_file, map_location=device)
         config = checkpoint["model_config"]
@@ -438,7 +406,7 @@ class PARModelTrainer(PARModel):
         if not quiet:
             logger.info(f" Loading model configuration from {model_file}.")
 
-        model = PARModelTrainer(config)
+        model = TPNModelTrainer(config)
         model.load_model_weights(
             path=model_file,
             quiet=quiet,
@@ -471,63 +439,43 @@ class PARModelTrainer(PARModel):
         )
         
         # Define model and optimizer
-        maml_model = MAML(self, lr=self.config.inner_learning_rate, first_order=not self.config.second_order_maml, anil=False, allow_unused=True)
-        
+        # TODO: define 
         # Optimizer copied from their code
-        self.optimizer = torch.optim.AdamW(maml_model.parameters(), lr=self.config.outer_learning_rate, weight_decay=self.config.weight_decay)
+        # self.optimizer = torch.optim.AdamW(tpn_model.parameters(), lr=self.config.outer_learning_rate, weight_decay=self.config.weight_decay)
 
         # Overall outer loop steps
         for step in range(1, self.config.num_train_steps + 1):
             
             # Number of repeated steps on this batch
-            for update_on_current_batch_idx in range(self.config.num_updates_per_batch):
 
-                # Do inner loop on batch, one task at a time
-                pred_losses = []
-                for _ in range(self.config.tasks_per_batch):
-                    task_sample = next(train_task_sample_iterator)
-                    train_task_sample = torchify(task_sample, device=device)
-                    batches = train_task_sample.batches
-                    batch_labels = train_task_sample.batch_labels
-                    batch_numeric_labels = train_task_sample.batch_numeric_labels
-                    cloned_models, _ = run_on_batches(
-                        maml_model,
-                        batches=batches,
-                        batch_labels=batch_labels,
-                        batch_numeric_labels=batch_numeric_labels,
-                        train=True,
-                        #tasks_per_batch=self.config.tasks_per_batch,
-                    )
-
-                    # Make model predictions on query set
-                    assert len(batches) == len(cloned_models) == 1
-                    pred_eval = get_predictions(
-                        model=cloned_models[0], data_batch=batches[0], train=True
-                        )
-                    pred_loss = get_loss(
-                        model=cloned_models[0], pred_dict=pred_eval, train=True,
-                        flag=False, batch_features=batches[0]
-                    )
-                    pred_losses.append(pred_loss)
-                    del pred_loss
-                
-                # Outer loop update
-                pred_losses_tensor = torch.stack(pred_losses)
-                overall_loss = torch.sum(pred_losses_tensor) / len(pred_losses)
+            # Do inner loop on batch, one task at a time
+            pred_losses = []
+            for _ in range(self.config.tasks_per_batch):
+                task_sample = next(train_task_sample_iterator)
+                train_task_sample = torchify(task_sample, device=device)
+                batches = train_task_sample.batches
+                batch_labels = train_task_sample.batch_labels
+                batch_numeric_labels = train_task_sample.batch_numeric_labels
+                pred_loss, pred_metric = run_on_batches(
+                    self,
+                    batches=batches,
+                    batch_labels=batch_labels,
+                    batch_numeric_labels=batch_numeric_labels,
+                    train=True,
+                    #tasks_per_batch=self.config.tasks_per_batch,
+                )
+                pred_losses.append(pred_loss)
+                # overall_loss = torch.sum(pred_losses_tensor) / len(pred_losses)
                 self.optimizer.zero_grad()
-                overall_loss.backward()
-                torch.nn.utils.clip_grad_norm_(maml_model.parameters(), 1)
+                pred_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.parameters(), 1)
                 self.optimizer.step()
 
-                # print('Train Epoch:',self.train_epoch,', train update step:', k, ', loss_eval:', losses_eval.item())
-
-            task_batch_mean_loss = overall_loss.detach().cpu().item() #np.mean(pred_losses_tensor.detach().cpu().numpy())
-            #task_batch_avg_metrics = avg_task_metrics_list(task_batch_metrics)
+            pred_losses_tensor = torch.stack(pred_losses)
+            overall_loss = torch.sum(pred_losses_tensor) / len(pred_losses)
+            task_batch_mean_loss =  overall_loss.detach().cpu().item() #np.mean(pred_losses_tensor.detach().cpu().numpy())
             metric_logger.log_metrics(
                 loss=task_batch_mean_loss,
-                #avg_prec=task_batch_avg_metrics["avg_precision"][0],
-                #kappa=task_batch_avg_metrics["kappa"][0],
-                #acc=task_batch_avg_metrics["acc"][0],
             )
 
             if self.config.use_numeric_labels:
@@ -536,7 +484,7 @@ class PARModelTrainer(PARModel):
                 metric_to_use = "avg_precision"
 
             if step % self.config.validate_every_num_steps == 0:
-                valid_metric = validate_by_finetuning_on_tasks(maml_model, dataset, aml_run=aml_run, metric_to_use=metric_to_use)
+                valid_metric = validate_by_finetuning_on_tasks(self, dataset, aml_run=aml_run, metric_to_use=metric_to_use)
 
                 if aml_run:
                     # printing some measure of loss on all validation tasks.

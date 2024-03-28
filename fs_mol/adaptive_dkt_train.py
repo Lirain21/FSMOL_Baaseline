@@ -47,7 +47,7 @@ def parse_command_line():
     )
     add_graph_feature_extractor_arguments(parser)
 
-    parser.add_argument("--support_set_size", type=int, default=64, help="Size of support set")
+    parser.add_argument("--support_set_size", type=int, default=16, help="Size of support set")
     parser.add_argument(
         "--query_set_size",
         type=int,
@@ -164,7 +164,7 @@ def main():
         f"ADKTModel_{config.used_features}", args, torch=True
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:6" if torch.cuda.is_available() else "cpu")
     model_trainer = ADKTModelTrainer(config=config).to(device)
 
     logger.info(f"\tDevice: {device}")

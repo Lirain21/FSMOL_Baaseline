@@ -170,6 +170,9 @@ class FSMolTaskSample:
     def train_pos_label_ratio(self) -> float:
         return self.__compute_positive_fraction(self.train_samples)
 
+    @property 
+    def val_pos_label_ratio(self) -> float:
+        return self.__compute_positive_fraction(self.valid_samples)
     @property
     def test_pos_label_ratio(self) -> float:
         return self.__compute_positive_fraction(self.test_samples)

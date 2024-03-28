@@ -348,3 +348,123 @@ def eval_model(
     logger.info(f"=== Completed evaluation on all tasks.")
 
     return task_to_results
+
+
+
+def prw_eval_model(
+    test_model_fn: Callable[[FSMolTaskSample, str, int], BinaryEvalMetrics],
+    dataset: FSMolDataset,
+    train_set_sample_sizes: List[int],
+    out_dir: Optional[str] = None,
+    num_samples: int = 10,
+    valid_size_or_ratio: Union[int, float] = 0.0,
+    test_size_or_ratio: Optional[Union[int, float, Tuple[int, int]]] = None,
+    fold: DataFold = DataFold.TEST,
+    task_reader_fn: Optional[Callable[[List[RichPath], int], Iterable[FSMolTask]]] = None,
+    seed: int = 0,
+    filter_numeric_labels: bool = False,
+):
+    """Evaluate a model on the FSMolDataset passed.
+
+    Args:
+        test_model_fn: A callable directly evaluating the model of interest on a single task
+            sample in the form of an FSMolTaskSample. The test_model_fn should act on the task
+            sample with the model, using a temporary output folder and seed. All other required
+            variables should be defined in the same context as the callable. The function should
+            return a BinaryEvalMetrics/NumericEvalMetrics object from the task.
+        dataset: An FSMolDataset with paths to the data to be evaluated supplied.
+        train_set_samples_sizes: List[int], a list of the support set sizes at which to evaluate,
+            this is the train_samples size in a TaskSample.
+        out_dir: final output directory for evaluation results.
+        num_samples: number of repeated draws from the task's data on which to evaluate the model.
+        valid_size_or_ratio: size of validation set in a TaskSample.
+        test_size_or_ratio: size of the test set in a TaskSample.
+        fold: the fold of FSMolDataset on which to perform evaluation, typically will be the test fold.
+        task_reader_fn: Callable allowing additional transformations on the data prior to its batching
+            and passing through a model.
+        seed: an base external seed value. Repeated runs vary from this seed.
+    """
+    task_reading_kwargs = {"task_reader_fn": task_reader_fn} if task_reader_fn is not None else {}
+    task_to_results = {}
+
+    for task in dataset.get_task_reading_iterable(fold, **task_reading_kwargs):
+
+        if filter_numeric_labels:
+            task_numeric_labels = np.array([task.samples[i].numeric_label for i in range(len(task.samples))])
+            if (
+                (np.all(task_numeric_labels>=0.0) and np.all(task_numeric_labels<=100.0)) 
+                or np.any(task_numeric_labels<=0.0) 
+                or np.any(np.isinf(task_numeric_labels)) 
+                or np.any(np.isnan(task_numeric_labels))
+            ):
+                continue
+
+        test_results = []
+        for train_size in train_set_sample_sizes:
+            task_sampler = StratifiedTaskSampler(
+                train_size_or_ratio=train_size,
+                valid_size_or_ratio=valid_size_or_ratio,
+                test_size_or_ratio=test_size_or_ratio,
+                allow_smaller_test=True,
+            )
+
+            for run_idx in range(num_samples):
+                logger.info(f"=== Evaluating on {task.name}, #train {train_size}, run {run_idx}")
+                with prefix_log_msgs(
+                    f" Test - Task {task.name} - Size {train_size:3d} - Run {run_idx}"
+                ), tempfile.TemporaryDirectory() as temp_out_folder:
+                    local_seed = seed + run_idx
+
+                    try:
+                        task_sample = task_sampler.sample(task, seed=local_seed)
+                    except (
+                        DatasetTooSmallException,
+                        DatasetClassTooSmallException,
+                        FoldTooSmallException,
+                        ValueError,
+                    ) as e:
+                        logger.debug(
+                            f"Failed to draw sample with {train_size} train points for {task.name}. Skipping."
+                        )
+                        logger.debug("Sampling error: " + str(e))
+                        continue
+
+                    test_metrics = test_model_fn(task_sample, temp_out_folder, local_seed)
+
+                    if filter_numeric_labels:
+                        test_results.append(
+                            FSMolTaskSampleEvalResultsNumeric(
+                                task_name=task.name,
+                                seed=local_seed,
+                                num_train=train_size,
+                                num_test=len(task_sample.test_samples),
+                                **dataclasses.asdict(test_metrics),
+                            )
+                        )
+
+                    else:
+                        test_results.append(
+                            FSMolTaskSampleEvalResults(
+                                task_name=task.name,
+                                seed=local_seed,
+                                num_train=train_size,
+                                num_test=len(task_sample.test_samples),
+                                fraction_pos_train=task_sample.train_pos_label_ratio,
+                                fraction_pos_test=task_sample.test_pos_label_ratio,
+                                **dataclasses.asdict(test_metrics),
+                            )
+                        )
+
+        task_to_results[task.name] = test_results
+
+        if out_dir is not None:
+            if filter_numeric_labels:
+                write_csv_summary_numeric(os.path.join(out_dir, f"{task.name}_eval_results.csv"), test_results)
+            else:
+                write_csv_summary(os.path.join(out_dir, f"{task.name}_eval_results.csv"), test_results)
+
+    logger.info(f"=== Completed evaluation on all tasks.")
+
+    return task_to_results
+
+

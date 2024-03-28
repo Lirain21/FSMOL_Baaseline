@@ -300,7 +300,7 @@ class StratifiedTaskSampler(TaskSampler):
     def __init__(
         self,
         train_size_or_ratio: Union[int, float] = 128,
-        valid_size_or_ratio: Union[int, float] = 0.0,
+        valid_size_or_ratio: Union[int, float] = 10,
         test_size_or_ratio: Optional[Union[int, float, Tuple[int, int]]] = 256,
         allow_smaller_test: bool = True,
     ):
